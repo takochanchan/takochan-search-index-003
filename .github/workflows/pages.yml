@@ -1,0 +1,153 @@
+name: Deploy full-text search shard to GitHub Pages
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      works: ${{ steps.allocation.outputs.works }}
+    steps:
+      - name: Check out shard controller
+        uses: actions/checkout@v4
+
+      - name: Read pinned archive source
+        id: source
+        run: |
+          node --input-type=module -e '
+            import { appendFileSync, readFileSync } from "node:fs";
+            const source = JSON.parse(readFileSync("source.json", "utf8"));
+            if (source.schemaVersion !== 1 ||
+                !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(source.sourceRepository) ||
+                !/^[a-f0-9]{40}$/.test(source.sourceCommit) ||
+                !/^\d{3}$/.test(source.searchShard)) {
+              throw new Error("Invalid search shard source.json");
+            }
+            appendFileSync(process.env.GITHUB_OUTPUT,
+              `repository=${source.sourceRepository}\n` +
+              `commit=${source.sourceCommit}\n` +
+              `shard=${source.searchShard}\n`);
+          '
+
+      - name: Check out pinned archive code
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.source.outputs.repository }}
+          ref: ${{ steps.source.outputs.commit }}
+          path: archive
+
+      - name: Validate shard allocation
+        id: allocation
+        working-directory: archive
+        env:
+          SEARCH_SHARD: ${{ steps.source.outputs.shard }}
+        run: |
+          node --input-type=module -e '
+            import { appendFileSync } from "node:fs";
+            import { publications } from "./src/publications.mjs";
+            import { readSearchShardConfig, validateSearchShardAssignments } from "./scripts/search/shard-config.mjs";
+            const config = await readSearchShardConfig(process.cwd());
+            const shard = config.shards.find(item => item.id === process.env.SEARCH_SHARD);
+            if (!shard || shard.repository !== process.env.GITHUB_REPOSITORY) {
+              throw new Error("Pinned source does not configure this shard repository");
+            }
+            const count = validateSearchShardAssignments(publications, config).get(shard.id);
+            appendFileSync(process.env.GITHUB_OUTPUT, `works=${count}\n`);
+            if (!count) console.log("Reserved shard: no assigned works; no index deployment needed.");
+          '
+
+      - name: Configure Pages
+        if: steps.allocation.outputs.works != '0'
+        uses: actions/configure-pages@v5
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install build dependencies
+        if: steps.allocation.outputs.works != '0'
+        working-directory: archive
+        run: npm ci --no-audit --no-fund
+
+      - name: Restore final assets and OCR cache
+        if: steps.allocation.outputs.works != '0'
+        id: search-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            archive/.cache/fulltext-assets
+            archive/.cache/fulltext-ocr
+          key: search-${{ steps.source.outputs.shard }}-${{ hashFiles('source.json') }}
+          restore-keys: |
+            search-${{ steps.source.outputs.shard }}-
+
+      - name: Ensure PDF text and OCR tools are available
+        if: steps.allocation.outputs.works != '0'
+        run: |
+          if ! command -v pdftotext || ! command -v tesseract; then
+            sudo apt-get update
+            sudo apt-get install -y poppler-utils tesseract-ocr
+          fi
+
+      - name: Fetch checksum-verified shard inputs
+        if: steps.allocation.outputs.works != '0'
+        working-directory: archive
+        env:
+          SEARCH_SHARD: ${{ steps.source.outputs.shard }}
+        run: npm run fetch:search-assets
+
+      - name: Build shard
+        if: steps.allocation.outputs.works != '0'
+        working-directory: archive
+        env:
+          SEARCH_SHARD: ${{ steps.source.outputs.shard }}
+        run: npm run build:search
+
+      - name: Save final assets and OCR cache
+        if: always() && steps.allocation.outputs.works != '0' && steps.search-cache.outputs.cache-primary-key != '' && steps.search-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            archive/.cache/fulltext-assets
+            archive/.cache/fulltext-ocr
+          key: ${{ steps.search-cache.outputs.cache-primary-key }}
+
+      - name: Verify shard
+        if: steps.allocation.outputs.works != '0'
+        working-directory: archive
+        env:
+          SEARCH_SHARD: ${{ steps.source.outputs.shard }}
+        run: |
+          npm run verify:search
+          touch dist/search/.nojekyll
+
+      - name: Upload Pages artifact
+        if: steps.allocation.outputs.works != '0'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: archive/dist/search
+
+  deploy:
+    if: needs.build.outputs.works != '0'
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy search shard
+        id: deployment
+        uses: actions/deploy-pages@v4
